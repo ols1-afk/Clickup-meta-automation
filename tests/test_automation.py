@@ -1,23 +1,21 @@
-import hashlib
-import hmac
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from app.clickup import BriefError, build_brief, normalize_cta, status_change_target, verify_signature
+from app.clickup import BriefError, build_brief, image_attachments, normalize_cta
 from app.drive import DriveFile, natural_key, parse_drive_id
 from app.meta import MetaAPIError, MetaClient, build_link_spec, verify_creative
-from app.pipeline import run, summary
+from app.pipeline import ad_names_for, run, summary
 from app.text import format_primary_text
 
 CFG = SimpleNamespace(
     field_campaign="Campaign",
     field_headline="Headline",
     field_cta="CTA",
-    field_link="Link",
+    field_link="URL Destination",
     field_drive="Drive Link",
-    field_primary_text="Primary Text",
+    field_primary_text="Primary Text 1",
     meta_page_id="PAGE",
     meta_instagram_user_id=None,
     meta_template_adset_id="TEMPLATE",
@@ -41,7 +39,7 @@ def task(**overrides):
         "custom_fields": [
             {"name": "Campaign", "type": "short_text", "value": "UK Prospecting"},
             {"name": "Headline", "type": "short_text", "value": "The 10-second fix"},
-            {"name": "Link", "type": "url", "value": "https://example.com/offer"},
+            {"name": "URL Destination", "type": "short_text", "value": "https://example.com/offer"},
             {
                 "name": "CTA",
                 "type": "drop_down",
@@ -51,6 +49,12 @@ def task(**overrides):
                     {"id": "o1", "name": "No button", "orderindex": 1},
                 ]},
             },
+        ],
+        "attachments": [
+            {"title": "Image 10.png", "extension": "png", "url": "https://att/10"},
+            {"title": "brief.pdf", "extension": "pdf", "url": "https://att/pdf"},
+            {"title": "Image 2.JPG", "extension": "JPG", "url": "https://att/2"},
+            {"title": "old.png", "extension": "png", "url": "https://att/old", "deleted": True},
         ],
     }
     t.update(overrides)
@@ -93,7 +97,7 @@ def test_build_brief_from_task():
 
 def test_build_brief_reports_missing_fields():
     t = task(custom_fields=[{"name": "CTA", "type": "short_text", "value": "Learn more"}])
-    with pytest.raises(BriefError, match="Campaign.*Headline.*Link"):
+    with pytest.raises(BriefError, match="Campaign.*Headline.*URL Destination"):
         build_brief(t, CFG)
 
 
@@ -111,14 +115,18 @@ def test_empty_cta_is_an_error():
         normalize_cta("  ")
 
 
-def test_webhook_helpers():
-    body = b'{"event":"taskStatusUpdated"}'
-    sig = hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
-    assert verify_signature("s3cret", body, sig)
-    assert not verify_signature("s3cret", body, "nope")
-    payload = {"event": "taskStatusUpdated", "history_items": [{"field": "status", "after": {"status": "Push to Facebook"}}]}
-    assert status_change_target(payload) == "Push to Facebook"
-    assert status_change_target({"event": "taskUpdated"}) is None
+def test_primary_text_field_wins_over_description():
+    t = task()
+    t["custom_fields"].append({"name": "Primary Text 1", "type": "text", "value": "Line A\nLine B"})
+    assert build_brief(t, CFG).primary_text == "Line A\n\nLine B"
+
+
+def test_image_attachments_filtered_and_sorted():
+    assert [a["name"] for a in image_attachments(task())] == ["Image 2.JPG", "Image 10.png"]
+
+
+def test_duplicate_file_names_get_unique_ad_names():
+    assert ad_names_for("Set", ["a.png", "a.jpg", "b.png"]) == ["Set - a", "Set - a (2)", "Set - b"]
 
 
 # ----------------------------------------------------------------- drive
@@ -185,16 +193,22 @@ def test_create_creative_drops_unknown_feature_keys():
 
 
 class FakeClickUp:
+    def __init__(self, t=None):
+        self.t = t or task()
+
     def get_task(self, task_id):
-        return task()
+        return self.t
+
+    def download(self, url):
+        return b"bytes-" + url.encode()
 
 
 class FakeDrive:
     def list_images(self, url):
-        return [DriveFile("1", "Image 1.jpg", "image/jpeg"), DriveFile("2", "Image 2.png", "image/png")], ["brief.pdf"]
+        return [DriveFile("1", "Drive 1.jpg", "image/jpeg")], ["notes.pdf"]
 
     def download(self, f):
-        return b"bytes-" + f.id.encode()
+        return b"drive-" + f.id.encode()
 
 
 class FakeMeta:
@@ -236,17 +250,28 @@ class FakeMeta:
         return f"AD{len(self.created_ads)}"
 
 
-def test_pipeline_one_ad_per_image_same_copy():
-    meta = FakeMeta(existing_ads={"UK | Native | Hook A - Image 1"})
+def test_pipeline_one_ad_per_attached_image_same_copy():
+    meta = FakeMeta(existing_ads={"UK | Native | Hook A - Image 2"})
     result = run("abc123", CFG, FakeClickUp(), FakeDrive(), meta)
 
     assert result.ok and result.adset_id == "AS1" and result.adset_created
-    assert [(a.image, a.status) for a in result.ads] == [("Image 1.jpg", "skipped"), ("Image 2.png", "created")]
-    assert meta.created_ads == [("UK | Native | Hook A - Image 2", "AS1", "CR0")]
+    assert [(a.image, a.status) for a in result.ads] == [("Image 2.JPG", "skipped"), ("Image 10.png", "created")]
+    assert meta.created_ads == [("UK | Native | Hook A - Image 10", "AS1", "CR0")]
     link_data = meta.creatives["CR0"]["object_story_spec"]["link_data"]
-    assert link_data["image_hash"] == "hash-Image 2.png"
+    assert link_data["image_hash"] == "hash-Image 10.png"
     assert link_data["call_to_action"] == {"type": "NO_BUTTON"}
-    assert "brief.pdf" in summary(result)
+    assert link_data["message"].startswith("Tired of bloating?\n\nMost people")
+
+
+def test_pipeline_falls_back_to_drive_when_nothing_attached():
+    result = run("abc123", CFG, FakeClickUp(task(attachments=[])), FakeDrive(), meta=None, dry_run=True)
+    assert [a.image for a in result.ads] == ["Drive 1.jpg"]
+    assert "notes.pdf" in summary(result)
+
+
+def test_pipeline_without_images_is_an_error():
+    with pytest.raises(BriefError, match="No images"):
+        run("abc123", CFG, FakeClickUp(task(attachments=[], markdown_description="Hi")), None, meta=None, dry_run=True)
 
 
 def test_pipeline_dry_run_touches_nothing_in_meta():

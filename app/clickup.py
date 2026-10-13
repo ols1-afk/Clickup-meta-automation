@@ -1,15 +1,16 @@
 """Minimal ClickUp API v2 client plus the task -> ad brief mapping."""
 
-import hashlib
-import hmac
+import os
 import re
 from dataclasses import dataclass
 
 import requests
 
+from .drive import natural_key
 from .text import DRIVE_URL_RE, format_primary_text
 
 API = "https://api.clickup.com/api/v2"
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif"}
 
 
 class ClickUpError(RuntimeError):
@@ -23,7 +24,7 @@ class BriefError(ValueError):
 class ClickUpClient:
     def __init__(self, token: str, session: requests.Session | None = None):
         self.session = session or requests.Session()
-        self.session.headers.update({"Authorization": token, "Content-Type": "application/json"})
+        self.session.headers.update({"Authorization": token})
 
     def _call(self, method: str, path: str, **kwargs) -> dict:
         resp = self.session.request(method, f"{API}{path}", timeout=60, **kwargs)
@@ -40,30 +41,39 @@ class ClickUpClient:
     def set_status(self, task_id: str, status: str) -> None:
         self._call("PUT", f"/task/{task_id}", json={"status": status})
 
-    def create_webhook(self, team_id: str, endpoint: str, list_id: str | None = None) -> dict:
-        body = {"endpoint": endpoint, "events": ["taskStatusUpdated"]}
-        if list_id:
-            body["list_id"] = int(list_id)
-        return self._call("POST", f"/team/{team_id}/webhook", json=body)
+    def tasks_in_status(self, team_id: str, status: str, list_ids: tuple[str, ...] = ()) -> list[str]:
+        """IDs of every task (and subtask) currently in `status`."""
+        ids, page = [], 0
+        while True:
+            params = [("statuses[]", status.lower()), ("subtasks", "true"), ("page", str(page))]
+            params += [("list_ids[]", list_id) for list_id in list_ids]
+            batch = self._call("GET", f"/team/{team_id}/task", params=params).get("tasks", [])
+            ids += [t["id"] for t in batch]
+            if len(batch) < 100:
+                return ids
+            page += 1
+
+    def download(self, url: str) -> bytes:
+        """Download an attachment (works whether or not the Workspace requires auth for files)."""
+        resp = requests.get(url, timeout=120)
+        if resp.status_code in (401, 403):
+            resp = self.session.get(url, timeout=120)
+        if resp.status_code >= 400:
+            raise ClickUpError(f"Could not download attachment ({resp.status_code}): {url}")
+        return resp.content
 
 
-def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
-    if not signature:
-        return False
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
-def status_change_target(payload: dict) -> str | None:
-    """Return the new status name from a taskStatusUpdated webhook payload."""
-    if payload.get("event") != "taskStatusUpdated":
-        return None
-    for item in payload.get("history_items") or []:
-        if item.get("field") in (None, "status"):
-            after = item.get("after") or {}
-            if isinstance(after, dict) and after.get("status"):
-                return str(after["status"])
-    return None
+def image_attachments(task: dict) -> list[dict]:
+    """Image files attached to the task, in name order: [{"name", "url"}]."""
+    out = []
+    for att in task.get("attachments") or []:
+        if att.get("deleted") or att.get("is_folder") or not att.get("url"):
+            continue
+        title = att.get("title") or os.path.basename(att["url"].split("?")[0])
+        ext = (att.get("extension") or os.path.splitext(title)[1]).lower().lstrip(".")
+        if ext in IMAGE_EXTENSIONS:
+            out.append({"name": title, "url": att["url"]})
+    return sorted(out, key=lambda a: natural_key(a["name"]))
 
 
 # --------------------------------------------------------------------------- brief
@@ -78,7 +88,7 @@ class AdBrief:
     cta: str  # Meta call_to_action type, e.g. LEARN_MORE or NO_BUTTON
     link: str
     primary_text: str
-    drive_url: str
+    drive_url: str | None  # only used when no images are attached to the task
 
 
 # CTA labels as they appear in Ads Manager -> API enum.
@@ -164,18 +174,17 @@ def build_brief(task: dict, cfg) -> AdBrief:
         label
         for label, value in (
             ("task title (ad set name)", adset_name),
-            (f'"{cfg.field_campaign}" field', campaign),
-            (f'"{cfg.field_headline}" field', headline),
-            (f'"{cfg.field_link}" field (destination URL)', link),
-            ("Google Drive link", drive_url),
-            ("primary text (task description)", primary_text),
+            (f'"{cfg.field_campaign}"', campaign),
+            (f'"{cfg.field_headline}"', headline),
+            (f'"{cfg.field_link}"', link),
+            (f'"{cfg.field_primary_text}" (or the task description)', primary_text),
         )
         if not value
     ]
     if missing:
         raise BriefError("Missing: " + ", ".join(missing))
     if not re.match(r"https?://", link):
-        raise BriefError(f"Link must start with http:// or https:// (got {link!r})")
+        raise BriefError(f"{cfg.field_link} must start with http:// or https:// (got {link!r})")
 
     return AdBrief(
         task_id=task["id"],

@@ -1,10 +1,11 @@
-"""ClickUp task -> one Meta ad set with one plain image ad per Drive image."""
+"""ClickUp task -> one Meta ad set with one plain image ad per attached image."""
 
 import logging
 import os
 from dataclasses import dataclass, field
+from typing import Callable
 
-from .clickup import AdBrief, BriefError, ClickUpClient, build_brief
+from .clickup import AdBrief, BriefError, ClickUpClient, build_brief, image_attachments
 from .config import Config
 from .drive import DriveClient
 from .meta import OPT_OUT_FEATURES, MetaClient, build_link_spec, verify_creative
@@ -13,11 +14,17 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class Image:
+    name: str
+    load: Callable[[], bytes]
+
+
+@dataclass
 class AdResult:
     image: str
     ad_name: str
     ad_id: str | None = None
-    status: str = ""  # created | skipped | failed
+    status: str = ""  # planned | created | skipped | failed
     problems: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -37,22 +44,41 @@ class RunResult:
         return all(a.status != "failed" and not a.problems for a in self.ads)
 
 
-def ad_name_for(adset_name: str, image_name: str) -> str:
-    return f"{adset_name} - {os.path.splitext(image_name)[0]}"
+def ad_names_for(adset_name: str, image_names: list[str]) -> list[str]:
+    """`<ad set> - <file name>`, made unique if two files share a name."""
+    names, seen = [], {}
+    for image_name in image_names:
+        name = f"{adset_name} - {os.path.splitext(image_name)[0]}"
+        seen[name] = seen.get(name, 0) + 1
+        names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+    return names
 
 
-def run(task_id: str, cfg: Config, clickup: ClickUpClient, drive: DriveClient, meta: MetaClient, dry_run: bool = False) -> RunResult:
-    brief = build_brief(clickup.get_task(task_id), cfg)
+def collect_images(task: dict, brief: AdBrief, clickup: ClickUpClient, drive: DriveClient | None) -> tuple[list[Image], list[str]]:
+    """Images attached to the task; falls back to a Drive link when nothing is attached."""
+    attached = image_attachments(task)
+    if attached:
+        return [Image(a["name"], lambda url=a["url"]: clickup.download(url)) for a in attached], []
+    if brief.drive_url and drive is not None:
+        files, skipped = drive.list_images(brief.drive_url)
+        warnings = ["Skipped non-image files in Drive: " + ", ".join(skipped)] if skipped else []
+        return [Image(f.name, lambda f=f: drive.download(f)) for f in files], warnings
+    raise BriefError("No images found. Attach the JPG/PNG images to the task.")
+
+
+def run(task_id: str, cfg: Config, clickup: ClickUpClient, drive: DriveClient | None, meta: MetaClient, dry_run: bool = False) -> RunResult:
+    task = clickup.get_task(task_id)
+    brief = build_brief(task, cfg)
     result = RunResult(brief=brief, dry_run=dry_run)
 
-    images, skipped = drive.list_images(brief.drive_url)
-    if skipped:
-        result.warnings.append("Skipped non-image files in Drive: " + ", ".join(skipped))
+    images, warnings = collect_images(task, brief, clickup, drive)
+    result.warnings.extend(warnings)
     if not images:
-        raise BriefError("No JPG/PNG/GIF images found at the Drive link.")
+        raise BriefError("No JPG/PNG/GIF images found.")
+    names = ad_names_for(brief.adset_name, [img.name for img in images])
 
     if dry_run:
-        result.ads = [AdResult(image=img.name, ad_name=ad_name_for(brief.adset_name, img.name), status="planned") for img in images]
+        result.ads = [AdResult(image=img.name, ad_name=name, status="planned") for img, name in zip(images, names)]
         return result
 
     campaign = meta.find_campaign(brief.campaign_name)
@@ -71,14 +97,14 @@ def run(task_id: str, cfg: Config, clickup: ClickUpClient, drive: DriveClient, m
     existing = meta.ad_names(result.adset_id)
     features = list(cfg.meta_opt_out_features or OPT_OUT_FEATURES)
 
-    for image in images:
-        ad = AdResult(image=image.name, ad_name=ad_name_for(brief.adset_name, image.name))
+    for image, name in zip(images, names):
+        ad = AdResult(image=image.name, ad_name=name)
         result.ads.append(ad)
         if ad.ad_name in existing:
             ad.status = "skipped"
             continue
         try:
-            image_hash = meta.upload_image(image.name, drive.download(image))
+            image_hash = meta.upload_image(image.name, image.load())
             spec = build_link_spec(cfg.meta_page_id, cfg.meta_instagram_user_id, brief, image_hash)
             creative_id, rejected = meta.create_creative(ad.ad_name, spec, features, cfg.meta_url_tags)
             if rejected:
@@ -125,26 +151,28 @@ def summary(result: RunResult) -> str:
     return "\n".join(lines)
 
 
-def process_task(task_id: str, cfg: Config, dry_run: bool = False) -> RunResult | None:
-    """Full run with ClickUp feedback (comment + status). Used by the webhook and CLI."""
-    clickup = ClickUpClient(cfg.clickup_token)
-    drive = DriveClient(cfg.google_service_account_file, cfg.google_service_account_json, cfg.google_api_key)
+def clients(cfg: Config) -> tuple[ClickUpClient, DriveClient | None, MetaClient]:
+    drive = None
+    if cfg.google_service_account_file or cfg.google_service_account_json or cfg.google_api_key:
+        drive = DriveClient(cfg.google_service_account_file, cfg.google_service_account_json, cfg.google_api_key)
     meta = MetaClient(cfg.meta_access_token, cfg.meta_ad_account_id, cfg.meta_api_version)
+    return ClickUpClient(cfg.clickup_token), drive, meta
+
+
+def process_task(task_id: str, cfg: Config, dry_run: bool = False) -> RunResult:
+    """Full run with ClickUp feedback: a summary comment, then the done/failed status."""
+    clickup, drive, meta = clients(cfg)
     try:
         result = run(task_id, cfg, clickup, drive, meta, dry_run=dry_run)
     except Exception as exc:
         log.exception("Task %s failed", task_id)
         if not dry_run:
             clickup.comment(task_id, f"Meta upload failed, nothing more was created.\n{exc}")
-            if cfg.failed_status:
-                clickup.set_status(task_id, cfg.failed_status)
+            clickup.set_status(task_id, cfg.failed_status)
         raise
 
-    text = summary(result)
-    log.info("Task %s:\n%s", task_id, text)
+    log.info("Task %s:\n%s", task_id, summary(result))
     if not dry_run:
-        clickup.comment(task_id, text)
-        status = cfg.done_status if result.ok else cfg.failed_status
-        if status:
-            clickup.set_status(task_id, status)
+        clickup.comment(task_id, summary(result))
+        clickup.set_status(task_id, cfg.done_status if result.ok else cfg.failed_status)
     return result

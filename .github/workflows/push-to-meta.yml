@@ -1,0 +1,56 @@
+name: Push to Meta
+
+on:
+  schedule:
+    # Every 15 minutes, Mon-Fri, 07:00-19:59 UTC (fits the 2,000 free minutes/month of a
+    # private repo). GitHub can start scheduled runs a few minutes late.
+    - cron: "*/15 7-19 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "ClickUp task ID (leave empty to process every task in the trigger status)"
+        required: false
+      dry_run:
+        description: "Dry run: read the task only, create nothing in Meta"
+        type: boolean
+        default: true
+
+# Never run two uploads at once (stops duplicate ads).
+concurrency:
+  group: push-to-meta
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+      CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
+      CLICKUP_LIST_IDS: ${{ secrets.CLICKUP_LIST_IDS }}
+      CLICKUP_TRIGGER_STATUS: ${{ vars.CLICKUP_TRIGGER_STATUS }}
+      CLICKUP_DONE_STATUS: ${{ vars.CLICKUP_DONE_STATUS }}
+      CLICKUP_FAILED_STATUS: ${{ vars.CLICKUP_FAILED_STATUS }}
+      META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+      META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+      META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+      META_INSTAGRAM_USER_ID: ${{ secrets.META_INSTAGRAM_USER_ID }}
+      META_TEMPLATE_ADSET_ID: ${{ secrets.META_TEMPLATE_ADSET_ID }}
+      META_AD_STATUS: ${{ vars.META_AD_STATUS }}
+      META_URL_TAGS: ${{ vars.META_URL_TAGS }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Process one task
+        if: github.event_name == 'workflow_dispatch' && inputs.task_id != ''
+        run: python -m app.cli run "$TASK_ID" ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          TASK_ID: ${{ inputs.task_id }}
+      - name: Process every task in the trigger status
+        if: github.event_name == 'schedule' || inputs.task_id == ''
+        run: python -m app.cli poll ${{ inputs.dry_run && '--dry-run' || '' }}
