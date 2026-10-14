@@ -7,13 +7,17 @@ on:
     - cron: "*/15 7-19 * * 1-5"
   workflow_dispatch:
     inputs:
+      action:
+        description: "What to do"
+        type: choice
+        default: "check setup"
+        options:
+          - "check setup"
+          - "dry run"
+          - "push to Meta"
       task_id:
-        description: "ClickUp task ID (leave empty to process every task in the trigger status)"
+        description: "ClickUp task ID (empty = every task in Push to Facebook). Not used by 'check setup'."
         required: false
-      dry_run:
-        description: "Dry run: read the task only, create nothing in Meta"
-        type: boolean
-        default: true
 
 # Never run two uploads at once (stops duplicate ads).
 concurrency:
@@ -39,6 +43,8 @@ jobs:
       META_AD_STATUS: ${{ vars.META_AD_STATUS }}
       META_URL_TAGS: ${{ vars.META_URL_TAGS }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      ACTION: ${{ inputs.action || 'push to Meta' }}
+      TASK_ID: ${{ inputs.task_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,11 +52,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Process one task
-        if: github.event_name == 'workflow_dispatch' && inputs.task_id != ''
-        run: python -m app.cli run "$TASK_ID" ${{ inputs.dry_run && '--dry-run' || '' }}
-        env:
-          TASK_ID: ${{ inputs.task_id }}
-      - name: Process every task in the trigger status
-        if: github.event_name == 'schedule' || inputs.task_id == ''
-        run: python -m app.cli poll ${{ inputs.dry_run && '--dry-run' || '' }}
+      - name: Run
+        run: |
+          case "$ACTION" in
+            "check setup") python -m app.cli check ;;
+            "dry run")     if [ -n "$TASK_ID" ]; then python -m app.cli run "$TASK_ID" --dry-run; else python -m app.cli poll --dry-run; fi ;;
+            *)             if [ -n "$TASK_ID" ]; then python -m app.cli run "$TASK_ID"; else python -m app.cli poll; fi ;;
+          esac

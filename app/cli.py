@@ -2,12 +2,14 @@
 
   python -m app.cli poll [--dry-run]           process every task in the trigger status
   python -m app.cli run <task_id> [--dry-run]  process one task by hand
+  python -m app.cli check                      test every key, ID, status and field
 """
 
 import argparse
 import logging
 import sys
 
+from .check import check
 from .clickup import ClickUpClient
 from .config import Config, ConfigError
 from .pipeline import process_task, summary
@@ -44,8 +46,12 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("task_id")
     run_p.add_argument("--dry-run", action="store_true", help="Read ClickUp only; create nothing, change nothing")
 
+    sub.add_parser("check", help="Test every key, ID, status and field; change nothing")
+
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.cmd == "check":
+        return check()
     cfg = Config.from_env()
 
     if args.cmd == "poll":

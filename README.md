@@ -93,9 +93,17 @@ Optional **variables** (on the Variables tab):
 
 **Keep this repository private.** Action logs on a public repo are visible to anyone. A private repo gets 2,000 free Actions minutes a month. The schedule (every 15 minutes, Mon–Fri 07:00–20:00 UTC) uses about 1,150, and you can change it in [`.github/workflows/push-to-meta.yml`](.github/workflows/push-to-meta.yml).
 
-### 4. Test it
+### 4. Check and test
 
-Go to **Actions → Push to Meta → Run workflow**, enter a task ID (from the task URL `app.clickup.com/t/<task id>`) and leave **Dry run** ticked. The log shows the ad set name, the images it found and the exact primary text, and creates nothing. Untick Dry run to do it for real.
+Go to **Actions → Push to Meta → Run workflow** and pick an action:
+
+| Action | What it does |
+|---|---|
+| **check setup** | Tests every secret, token permission, ad account, Page, template ad set, ClickUp status and field, and whether each Campaign dropdown option has a Meta campaign with that exact name. Prints a checklist of anything to fix. Creates nothing. |
+| **dry run** | Reads the task (enter its ID from `app.clickup.com/t/<task id>`, or leave it empty for every task in Push to Facebook). Shows the ad set name, the images and the exact primary text. Creates nothing. |
+| **push to Meta** | Does it for real, same as the schedule does. |
+
+Run **check setup** first, and set `CLICKUP_LIST_IDS` so it can check the list's statuses and fields.
 
 ## Re-running
 

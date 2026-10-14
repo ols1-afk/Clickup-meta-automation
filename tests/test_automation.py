@@ -277,3 +277,64 @@ def test_pipeline_without_images_is_an_error():
 def test_pipeline_dry_run_touches_nothing_in_meta():
     result = run("abc123", CFG, FakeClickUp(), FakeDrive(), meta=None, dry_run=True)
     assert [a.status for a in result.ads] == ["planned", "planned"]
+
+
+# ----------------------------------------------------------------- setup check
+
+
+def test_check_reports_problems(monkeypatch, capsys):
+    import app.check as check_mod
+
+    env = {
+        "CLICKUP_API_TOKEN": "pk", "CLICKUP_TEAM_ID": "9", "CLICKUP_LIST_IDS": "L1",
+        "META_ACCESS_TOKEN": "t", "META_AD_ACCOUNT_ID": "act_1", "META_PAGE_ID": "P", "META_TEMPLATE_ADSET_ID": "T",
+    }
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    class CU:
+        def __init__(self, token):
+            pass
+
+        def _call(self, method, path, **kw):
+            return {
+                "/user": {"user": {"username": "Joey"}},
+                "/team": {"teams": [{"id": "9", "name": "Agency"}]},
+                "/list/L1": {"name": "Ads", "statuses": [{"status": "push to facebook"}, {"status": "in meta"}]},
+                "/list/L1/field": {"fields": [
+                    {"name": "Campaign", "type": "drop_down", "type_config": {"options": [{"name": "UK Prospecting"}, {"name": "Typo"}]}},
+                    {"name": "Headline", "type": "short_text"},
+                    {"name": "CTA", "type": "drop_down", "type_config": {"options": [{"name": "Learn More"}]}},
+                    {"name": "URL Destination", "type": "short_text"},
+                    {"name": "Primary Text 1", "type": "short_text"},
+                ]},
+            }[path]
+
+    class M(FakeMeta):
+        account = "act_1"
+
+        def __init__(self, *a):
+            super().__init__()
+
+        def get(self, path, **kw):
+            return {
+                "me": {"name": "ClickUp"},
+                "me/permissions": {"data": [{"permission": "ads_management", "status": "granted"}]},
+                "act_1": {"name": "Acct", "account_status": 1, "currency": "GBP"},
+                "P": {"name": "Page"},
+                "T": {"name": "Template", "effective_status": "PAUSED"},
+            }[path]
+
+        def get_all(self, path, **kw):
+            return [{"name": "UK Prospecting", "effective_status": "ACTIVE"}]
+
+        def adset_warnings(self, adset_id):
+            return ["Ad set uses Advantage+ placements"]
+
+    monkeypatch.setattr(check_mod, "ClickUpClient", CU)
+    monkeypatch.setattr(check_mod, "MetaClient", M)
+    assert check_mod.check() == 1
+    out = capsys.readouterr().out
+    for needle in ("status 'meta failed' missing", "Short Text", "no 'No button'", "missing permissions: ads_read",
+                   "Advantage+ placements", "'Typo' has no Meta campaign", "OK    campaign 'UK Prospecting'"):
+        assert needle in out, needle
